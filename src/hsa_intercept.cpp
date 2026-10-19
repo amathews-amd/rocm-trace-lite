@@ -185,6 +185,7 @@ struct DispatchData {
     uint64_t hw_queue_addr;         // HW queue base_address
     uint16_t wg_x, wg_y, wg_z;     // workgroup size from AQL packet
     uint32_t grid_x, grid_y, grid_z; // grid size from AQL packet
+    uint64_t roctx_id;              // enclosing roctx range (host thread)
 };
 
 static std::mutex g_work_mutex;
@@ -255,15 +256,37 @@ static void completion_worker() {
             g_drop_ts_invalid.fetch_add(1, std::memory_order_relaxed);
         } else {
             std::string name = lookup_kernel_name(dd->kernel_object);
-            char dispatch_info[128];
-            snprintf(dispatch_info, sizeof(dispatch_info),
-                     "hwq=0x%" PRIx64 " wg=%u,%u,%u grid=%u,%u,%u",
-                     dd->hw_queue_addr,
-                     (unsigned)dd->wg_x, (unsigned)dd->wg_y, (unsigned)dd->wg_z,
-                     dd->grid_x, dd->grid_y, dd->grid_z);
-            get_trace_db().record_kernel(name.c_str(), dd->device_id, dd->queue_id,
-                                          time.start, time.end, dd->correlation_id,
-                                          dispatch_info);
+            auto kernel_cb = trace_db::get_kernel_event_callback();
+            if (kernel_cb) {
+                trace_db::KernelEventRecord rec;
+                rec.name = name.c_str();
+                rec.device_id = dd->device_id;
+                rec.queue_id = dd->queue_id;
+                rec.start_ns = time.start;
+                rec.end_ns = time.end;
+                rec.correlation_id = dd->correlation_id;
+                rec.wg_x = dd->wg_x;
+                rec.wg_y = dd->wg_y;
+                rec.wg_z = dd->wg_z;
+                rec.grid_x = dd->grid_x;
+                rec.grid_y = dd->grid_y;
+                rec.grid_z = dd->grid_z;
+                try {
+                    kernel_cb(rec, trace_db::get_kernel_event_callback_data());
+                } catch (...) {
+                    fprintf(stderr, "rtl: exception escaped kernel event callback\n");
+                }
+            } else {
+                char dispatch_info[128];
+                snprintf(dispatch_info, sizeof(dispatch_info),
+                         "hwq=0x%" PRIx64 " wg=%u,%u,%u grid=%u,%u,%u",
+                         dd->hw_queue_addr,
+                         (unsigned)dd->wg_x, (unsigned)dd->wg_y, (unsigned)dd->wg_z,
+                         dd->grid_x, dd->grid_y, dd->grid_z);
+                get_trace_db().record_kernel(name.c_str(), dd->device_id, dd->queue_id,
+                                              time.start, time.end, dd->correlation_id,
+                                              dispatch_info, dd->roctx_id);
+            }
             g_recorded_ok.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -508,6 +531,7 @@ static void queue_intercept_cb(const void* in_packets, uint64_t count,
         auto* dd = new DispatchData;
         dd->dispatch_id = g_dispatch_id.fetch_add(1, std::memory_order_relaxed);
         dd->correlation_id = next_correlation_id();
+        dd->roctx_id = trace_db::current_roctx_id();
         dd->kernel_object = pkt->kernel_object;
         dd->device_id = qi->device_id;
         dd->queue_id = qi->queue_handle;
@@ -612,6 +636,92 @@ static hsa_status_t my_hsa_queue_create(
     return HSA_STATUS_SUCCESS;
 }
 
+// ROCm 10+: CLR calls hsa_amd_queue_create (batch descriptor API) instead of
+// hsa_queue_create.  Redirect each descriptor through hsa_amd_queue_intercept_create
+// so the dispatch callback fires.
+#ifdef HSA_AMD_QUEUE_CREATE_DESC_VERSION
+
+// Saved original so we can fall back for non-compute engine types.
+static decltype(AmdExtTable::hsa_amd_queue_create_fn) g_orig_amd_queue_create = nullptr;
+
+static hsa_status_t my_hsa_amd_queue_create(
+    hsa_agent_t agent, hsa_amd_queue_create_desc_t* descs, uint32_t num_descs) {
+
+    if (!descs || num_descs == 0)
+        return HSA_STATUS_ERROR_INVALID_ARGUMENT;
+
+    hsa_status_t first_error = HSA_STATUS_SUCCESS;
+
+    for (uint32_t i = 0; i < num_descs; i++) {
+        auto& d = descs[i];
+        d.queue = nullptr;
+
+        // Only intercept compute (AQL) queues — SDMA/AIE pass through to the
+        // original API (one descriptor at a time).
+        if (d.engine_type != HSA_AMD_QUEUE_ENGINE_COMPUTE || !g_intercept_available) {
+            hsa_status_t st = g_orig_amd_queue_create(agent, &d, 1);
+            if (st != HSA_STATUS_SUCCESS && first_error == HSA_STATUS_SUCCESS)
+                first_error = st;
+            continue;
+        }
+
+        // Extract parameters from the descriptor for hsa_amd_queue_intercept_create.
+        uint32_t queue_size = d.queue_size_bytes / sizeof(hsa_kernel_dispatch_packet_t);
+        if (queue_size == 0) queue_size = 64;
+        hsa_queue_type32_t type = d.engine.compute.type;
+        uint32_t priv_seg = d.engine.compute.private_segment_size;
+        uint32_t safe_priv_seg = (priv_seg == UINT32_MAX) ? 0 : priv_seg;
+
+        hsa_queue_t* queue = nullptr;
+        hsa_status_t st = g_orig_ext.hsa_amd_queue_intercept_create_fn(
+            agent, queue_size, type, d.callback, d.callback_data,
+            safe_priv_seg, 0, &queue);
+
+        if (st != HSA_STATUS_SUCCESS) {
+            // Fallback: create via the original API without intercept.
+            st = g_orig_amd_queue_create(agent, &d, 1);
+            if (st != HSA_STATUS_SUCCESS && first_error == HSA_STATUS_SUCCESS)
+                first_error = st;
+            continue;
+        }
+
+        d.queue = queue;
+
+        // Enable profiling timestamps on this queue.
+        g_orig_ext.hsa_amd_profiling_set_profiler_enabled_fn(queue, true);
+
+        // Apply priority if non-default.
+        if (d.priority != HSA_AMD_QUEUE_PRIORITY_NORMAL &&
+            g_orig_ext.hsa_amd_queue_set_priority_fn != nullptr) {
+            g_orig_ext.hsa_amd_queue_set_priority_fn(queue, d.priority);
+        }
+
+        // Build QueueInfo and register intercept callback (same as my_hsa_queue_create).
+        auto* qi = new QueueInfo;
+        qi->device_id = 0;
+        qi->queue_handle = (uint64_t)queue;
+        qi->hw_queue_addr = queue ? (uint64_t)queue->base_address : 0;
+        {
+            std::lock_guard<std::mutex> lock(g_agent_mutex);
+            for (size_t j = 0; j < g_gpu_agents.size(); j++) {
+                if (g_gpu_agents[j].handle == agent.handle) {
+                    qi->device_id = (int)j;
+                    break;
+                }
+            }
+        }
+        {
+            std::lock_guard<std::mutex> lock(g_queue_mutex);
+            g_queue_map[(uint64_t)queue] = *qi;
+        }
+        g_orig_ext.hsa_amd_queue_intercept_register_fn(queue, queue_intercept_cb, qi);
+    }
+
+    return first_error;
+}
+
+#endif // HSA_AMD_QUEUE_CREATE_DESC_VERSION
+
 static hsa_status_t my_hsa_executable_freeze(hsa_executable_t executable, const char* options) {
     hsa_status_t status = g_orig_core.hsa_executable_freeze_fn(executable, options);
     if (status == HSA_STATUS_SUCCESS) {
@@ -676,9 +786,11 @@ static void shutdown() {
         }
     }
 
-    // Flush and close trace DB
-    trace_db::get_trace_db().flush();
-    trace_db::get_trace_db().close();
+    // Flush and close trace DB (skip if never initialized — callback-only mode)
+    if (trace_db::is_trace_ready()) {
+        trace_db::get_trace_db().flush();
+        trace_db::get_trace_db().close();
+    }
 
     // Destroy signal pool.
     // At this point the system is quiesced: g_shutdown is true, the worker
@@ -705,6 +817,12 @@ static void shutdown() {
 
 } // namespace hsa_intercept
 
+namespace trace_db {
+void rtl_trigger_shutdown() {
+    hsa_intercept::shutdown();
+}
+} // namespace trace_db
+
 // ---- Entry points for HSA_TOOLS_LIB ----
 
 extern "C" bool OnLoad(void* pTable,
@@ -715,8 +833,10 @@ extern "C" bool OnLoad(void* pTable,
 
     using namespace hsa_intercept;
 
-    // Ensure trace database is open
-    (void)trace_db::get_trace_db();
+    // Ensure trace database is open (skip if callback hooks are set)
+    if (!trace_db::get_kernel_event_callback() && !trace_db::get_api_event_callback()) {
+        (void)trace_db::get_trace_db();
+    }
 
     // Save original API tables
     HsaApiTable* table = reinterpret_cast<HsaApiTable*>(pTable);
@@ -727,6 +847,16 @@ extern "C" bool OnLoad(void* pTable,
     // Replace queue creation and executable freeze
     table->core_->hsa_queue_create_fn = my_hsa_queue_create;
     table->core_->hsa_executable_freeze_fn = my_hsa_executable_freeze;
+
+    // ROCm 10+: CLR uses hsa_amd_queue_create instead of hsa_queue_create.
+    // Intercept the new API so dispatch profiling works on both old and new CLR.
+#ifdef HSA_AMD_QUEUE_CREATE_DESC_VERSION
+    if (table->amd_ext_->hsa_amd_queue_create_fn != nullptr) {
+        g_orig_amd_queue_create = g_orig_ext.hsa_amd_queue_create_fn;
+        table->amd_ext_->hsa_amd_queue_create_fn = my_hsa_amd_queue_create;
+        fprintf(stderr, "rtl: hsa_amd_queue_create intercepted (ROCm 10+ path)\n");
+    }
+#endif
 
     // Discover GPU agents (immutable after this point)
     hsa_iterate_agents(agent_iterate_cb, nullptr);
